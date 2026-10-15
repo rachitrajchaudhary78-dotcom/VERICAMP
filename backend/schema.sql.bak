@@ -1,0 +1,211 @@
+-- ====================================================================
+-- VERICAMP - Smart Faculty Attendance System
+-- Database Schema for MySQL 8.x / MariaDB
+-- Manageable via MySQL Workbench or MySQL Command-Line Client
+-- ====================================================================
+
+CREATE DATABASE IF NOT EXISTS `vericamp_db` 
+CHARACTER SET utf8mb4 
+COLLATE utf8mb4_unicode_ci;
+
+USE `vericamp_db`;
+
+-- --------------------------------------------------------------------
+-- 1. Table: users (Faculty & Administrative Accounts)
+-- --------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `users` (
+    `id` INT AUTO_INCREMENT PRIMARY KEY,
+    `employee_id` VARCHAR(50) NOT NULL UNIQUE,
+    `full_name` VARCHAR(120) NOT NULL,
+    `email` VARCHAR(120) NOT NULL,
+    `department` VARCHAR(100) NOT NULL,
+    `password_hash` VARCHAR(255) NOT NULL,
+    `role` ENUM('teacher', 'admin') NOT NULL DEFAULT 'teacher',
+    `phone` VARCHAR(30) NULL,
+    `is_active` TINYINT(1) NOT NULL DEFAULT 1,
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX `idx_users_employee_id` (`employee_id`),
+    INDEX `idx_users_role` (`role`),
+    INDEX `idx_users_department` (`department`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- --------------------------------------------------------------------
+-- 2. Table: face_enrollments (Biometric Reference Templates)
+-- --------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `face_enrollments` (
+    `id` INT AUTO_INCREMENT PRIMARY KEY,
+    `user_id` INT NOT NULL UNIQUE,
+    `face_template` TEXT NOT NULL COMMENT 'Access-controlled template hash/embedding vector',
+    `model_name` VARCHAR(60) NOT NULL DEFAULT 'OpenCV-Haar-HSV-Histogram',
+    `model_version` VARCHAR(20) NOT NULL DEFAULT 'v2.4',
+    `enrollment_status` ENUM('enrolled', 'pending', 'revoked') NOT NULL DEFAULT 'enrolled',
+    `enrolled_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    CONSTRAINT `fk_face_user` FOREIGN KEY (`user_id`) 
+        REFERENCES `users` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- --------------------------------------------------------------------
+-- 3. Table: attendance_records (Immutable Verified Presence Logs)
+-- --------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `attendance_records` (
+    `id` INT AUTO_INCREMENT PRIMARY KEY,
+    `user_id` INT NOT NULL,
+    `attendance_date` DATE NOT NULL,
+    `check_in_time` TIME NOT NULL,
+    `latitude` DECIMAL(10, 7) NOT NULL,
+    `longitude` DECIMAL(10, 7) NOT NULL,
+    `distance_meters` DECIMAL(8, 2) NOT NULL,
+    `face_score` DECIMAL(5, 2) NOT NULL,
+    `face_verification_status` ENUM('verified', 'failed') NOT NULL,
+    `location_verification_status` ENUM('verified', 'failed') NOT NULL,
+    `attendance_status` ENUM('present', 'late', 'rejected') NOT NULL,
+    `device_info` VARCHAR(255) NULL,
+    `failure_reason` VARCHAR(255) NULL,
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX `idx_attendance_user` (`user_id`),
+    INDEX `idx_attendance_date` (`attendance_date`),
+    INDEX `idx_attendance_status` (`attendance_status`),
+    INDEX `idx_attendance_user_date` (`user_id`, `attendance_date`),
+    CONSTRAINT `fk_attendance_user` FOREIGN KEY (`user_id`) 
+        REFERENCES `users` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- --------------------------------------------------------------------
+-- 4. Table: campus_settings (Institutional Geofence Coordinates)
+-- --------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `campus_settings` (
+    `id` INT PRIMARY KEY,
+    `campus_name` VARCHAR(150) NOT NULL,
+    `latitude` DECIMAL(10, 7) NOT NULL,
+    `longitude` DECIMAL(10, 7) NOT NULL,
+    `allowed_radius_meters` DECIMAL(8, 2) NOT NULL DEFAULT 300.00,
+    `wifi_ssid_required` TINYINT(1) NOT NULL DEFAULT 0,
+    `wifi_ssid_name` VARCHAR(100) NULL,
+    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- --------------------------------------------------------------------
+-- 5. Table: audit_logs (Institutional Security & Action Trail)
+-- --------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `audit_logs` (
+    `id` INT AUTO_INCREMENT PRIMARY KEY,
+    `user_id` INT NULL,
+    `action` VARCHAR(60) NOT NULL,
+    `target_type` VARCHAR(40) NOT NULL,
+    `target_id` VARCHAR(50) NULL,
+    `details` TEXT NOT NULL,
+    `timestamp` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX `idx_audit_user` (`user_id`),
+    INDEX `idx_audit_action` (`action`),
+    INDEX `idx_audit_time` (`timestamp`),
+    CONSTRAINT `fk_audit_user` FOREIGN KEY (`user_id`) 
+        REFERENCES `users` (`id`) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- --------------------------------------------------------------------
+-- 6. Table: leave_requests (Teacher Leave Workflow)
+-- --------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `leave_requests` (
+    `id` INT AUTO_INCREMENT PRIMARY KEY,
+    `teacher_id` INT NOT NULL,
+    `leave_type` VARCHAR(50) NOT NULL,
+    `start_date` DATE NOT NULL,
+    `end_date` DATE NOT NULL,
+    `reason` TEXT NOT NULL,
+    `status` ENUM('pending', 'approved', 'rejected', 'cancelled') NOT NULL DEFAULT 'pending',
+    `admin_remarks` TEXT NULL,
+    `reviewed_by` INT NULL,
+    `reviewed_at` DATETIME NULL,
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX `idx_leave_teacher` (`teacher_id`),
+    INDEX `idx_leave_status` (`status`),
+    INDEX `idx_leave_dates` (`start_date`, `end_date`),
+    INDEX `idx_leave_teacher_dates` (`teacher_id`, `start_date`, `end_date`),
+    CONSTRAINT `fk_leave_teacher` FOREIGN KEY (`teacher_id`) 
+        REFERENCES `users` (`id`) ON DELETE CASCADE,
+    CONSTRAINT `fk_leave_reviewer` FOREIGN KEY (`reviewed_by`) 
+        REFERENCES `users` (`id`) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- --------------------------------------------------------------------
+-- 7. Table: face_update_requests (Biometric Re-enrollment Workflow)
+-- --------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `face_update_requests` (
+    `id` INT AUTO_INCREMENT PRIMARY KEY,
+    `teacher_id` INT NOT NULL,
+    `reason` TEXT NOT NULL,
+    `status` ENUM('pending', 'approved', 'rejected', 'cancelled', 'completed') NOT NULL DEFAULT 'pending',
+    `admin_remarks` TEXT NULL,
+    `reviewed_by` INT NULL,
+    `reviewed_at` DATETIME NULL,
+    `completed_at` DATETIME NULL,
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX `idx_face_upd_teacher` (`teacher_id`),
+    INDEX `idx_face_upd_status` (`status`),
+    CONSTRAINT `fk_face_upd_teacher` FOREIGN KEY (`teacher_id`) 
+        REFERENCES `users` (`id`) ON DELETE CASCADE,
+    CONSTRAINT `fk_face_upd_reviewer` FOREIGN KEY (`reviewed_by`) 
+        REFERENCES `users` (`id`) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- --------------------------------------------------------------------
+-- 8. Table: notifications (System & User Alerts)
+-- --------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `notifications` (
+    `id` INT AUTO_INCREMENT PRIMARY KEY,
+    `recipient_user_id` INT NOT NULL,
+    `notification_type` VARCHAR(40) NOT NULL,
+    `title` VARCHAR(150) NOT NULL,
+    `message` TEXT NOT NULL,
+    `related_record_id` VARCHAR(50) NULL,
+    `is_read` TINYINT(1) NOT NULL DEFAULT 0,
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX `idx_notif_recipient` (`recipient_user_id`),
+    INDEX `idx_notif_read` (`is_read`),
+    INDEX `idx_notif_time` (`created_at`),
+    CONSTRAINT `fk_notif_recipient` FOREIGN KEY (`recipient_user_id`) 
+        REFERENCES `users` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ====================================================================
+-- INITIAL SEED DATA
+-- Default Passwords:
+--   admin  -> admin123
+--   teacher -> teacher123
+-- (Generated using Werkzeug scrypt hashing)
+-- ====================================================================
+
+-- 1. Institutional Campus Coordinates (SKIT Jaipur Central Campus)
+INSERT INTO `campus_settings` (`id`, `campus_name`, `latitude`, `longitude`, `allowed_radius_meters`, `wifi_ssid_required`, `wifi_ssid_name`, `updated_at`)
+VALUES (1, 'Swami Keshvanand Institute of Technology (SKIT) - Campus', 26.8227000, 75.8653000, 300.00, 1, 'SKIT_CAMPUS_SECURE', NOW())
+ON DUPLICATE KEY UPDATE `campus_name` = VALUES(`campus_name`);
+
+-- 2. Initial Institutional Users
+-- Admin: ADM-001 / admin / admin123
+-- Teachers: EMP-1001 to EMP-1005 / teacher123
+INSERT INTO `users` (`id`, `employee_id`, `full_name`, `email`, `department`, `password_hash`, `role`, `phone`, `is_active`, `created_at`)
+VALUES 
+(1, 'ADM-001', 'Prof. K. N. Sharma', 'admin@vericamp.edu', 'Institutional Administration', 'scrypt:32768:8:1$hU6G987f4lC2F00j$a8d7945d8b7b752df83f4d6d027a0ffb07693635bca55490bf9aa42e12e75e98547ca23439b1a5e1cf4b66df8704ce2a225330349c817293b0b57fa0d2e8e202', 'admin', '+91 98290 11223', 1, NOW()),
+(2, 'EMP-1001', 'Dr. Ananya Sharma', 'ananya.sharma@vericamp.edu', 'Computer Science & Engg', 'scrypt:32768:8:1$kY7G321f5lD3F11k$b9e8056e9c8c863ef94f5e7e138b100c18704746cdb66501c0abb53f23f86f09658db34540c2b6f2df5c77ef9815df3b336441450d928304c1c680b1e3f9f313', 'teacher', '+91 98290 33445', 1, NOW()),
+(3, 'EMP-1002', 'Prof. Rajesh Verma', 'rajesh.verma@vericamp.edu', 'Electronics & Comm. Engg', 'scrypt:32768:8:1$kY7G321f5lD3F11k$b9e8056e9c8c863ef94f5e7e138b100c18704746cdb66501c0abb53f23f86f09658db34540c2b6f2df5c77ef9815df3b336441450d928304c1c680b1e3f9f313', 'teacher', '+91 98290 44556', 1, NOW()),
+(4, 'EMP-1003', 'Dr. Sunita Rao', 'sunita.rao@vericamp.edu', 'Mechanical Engineering', 'scrypt:32768:8:1$kY7G321f5lD3F11k$b9e8056e9c8c863ef94f5e7e138b100c18704746cdb66501c0abb53f23f86f09658db34540c2b6f2df5c77ef9815df3b336441450d928304c1c680b1e3f9f313', 'teacher', '+91 98290 55667', 1, NOW()),
+(5, 'EMP-1004', 'Er. Amit Patel', 'amit.patel@vericamp.edu', 'Information Technology', 'scrypt:32768:8:1$kY7G321f5lD3F11k$b9e8056e9c8c863ef94f5e7e138b100c18704746cdb66501c0abb53f23f86f09658db34540c2b6f2df5c77ef9815df3b336441450d928304c1c680b1e3f9f313', 'teacher', '+91 98290 66778', 1, NOW()),
+(6, 'EMP-1005', 'Dr. Priya Nair', 'priya.nair@vericamp.edu', 'Applied Sciences & Math', 'scrypt:32768:8:1$kY7G321f5lD3F11k$b9e8056e9c8c863ef94f5e7e138b100c18704746cdb66501c0abb53f23f86f09658db34540c2b6f2df5c77ef9815df3b336441450d928304c1c680b1e3f9f313', 'teacher', '+91 98290 77889', 1, NOW())
+ON DUPLICATE KEY UPDATE `employee_id` = VALUES(`employee_id`);
+
+-- 3. Initial Biometric Face Enrollment Baselines
+INSERT INTO `face_enrollments` (`user_id`, `face_template`, `model_name`, `model_version`, `enrollment_status`, `enrolled_at`, `updated_at`)
+VALUES
+(2, 'sha256_enc_template_emp1001_v2.4', 'OpenCV-Haar-HSV-Histogram', 'v2.4', 'enrolled', NOW(), NOW()),
+(3, 'sha256_enc_template_emp1002_v2.4', 'OpenCV-Haar-HSV-Histogram', 'v2.4', 'enrolled', NOW(), NOW()),
+(4, 'sha256_enc_template_emp1003_v2.4', 'OpenCV-Haar-HSV-Histogram', 'v2.4', 'enrolled', NOW(), NOW()),
+(5, 'sha256_enc_template_emp1004_v2.4', 'OpenCV-Haar-HSV-Histogram', 'v2.4', 'pending', NOW(), NOW()),
+(6, 'sha256_enc_template_emp1005_v2.4', 'OpenCV-Haar-HSV-Histogram', 'v2.4', 'enrolled', NOW(), NOW())
+ON DUPLICATE KEY UPDATE `enrollment_status` = VALUES(`enrollment_status`);
+
+-- 4. Initial Audit Log
+INSERT INTO `audit_logs` (`user_id`, `action`, `target_type`, `target_id`, `details`, `timestamp`)
+VALUES (1, 'SYSTEM_INIT', 'SYSTEM', '1', 'VERICAMP MySQL database and institutional campus boundaries initialized.', NOW());

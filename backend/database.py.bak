@@ -1,0 +1,420 @@
+"""
+VERICAMP - Smart Faculty Attendance System
+Database Layer (SQLAlchemy + PyMySQL / SQLite Fallback)
+Supports MySQL 8.x / MariaDB / Workbench and SQLite fallback for local development.
+"""
+
+import os
+import re
+from datetime import datetime, date, time
+from dotenv import load_dotenv
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Text, Numeric, 
+    Boolean, Date, Time as SqlTime, DateTime, ForeignKey, Index, text
+)
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship, scoped_session
+from werkzeug.security import generate_password_hash, check_password_hash
+
+# Load environment variables
+load_dotenv()
+
+Base = declarative_base()
+
+def get_database_uri():
+    """
+    Constructs the SQLAlchemy database URI from environment variables.
+    Prioritizes DATABASE_URL if present, otherwise checks individual MYSQL_* variables.
+    Falls back to local SQLite if MySQL variables are not configured.
+    """
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if database_url:
+        if database_url.startswith("mysql://"):
+            database_url = database_url.replace("mysql://", "mysql+pymysql://", 1)
+        return database_url
+
+    mysql_host = os.environ.get("MYSQL_HOST", "").strip()
+    mysql_user = os.environ.get("MYSQL_USER", "").strip()
+    mysql_password = os.environ.get("MYSQL_PASSWORD", "").strip()
+    mysql_db = os.environ.get("MYSQL_DATABASE", "").strip()
+    mysql_port = os.environ.get("MYSQL_PORT", "3306").strip()
+
+    if mysql_host and mysql_user and mysql_db:
+        if mysql_password:
+            return f"mysql+pymysql://{mysql_user}:{mysql_password}@{mysql_host}:{mysql_port}/{mysql_db}?charset=utf8mb4"
+        else:
+            return f"mysql+pymysql://{mysql_user}@{mysql_host}:{mysql_port}/{mysql_db}?charset=utf8mb4"
+
+    # Fallback to local SQLite database in backend directory
+    db_path = os.path.join(os.path.dirname(__file__), "vericamp.db")
+    return f"sqlite:///{db_path}"
+
+DB_URI = get_database_uri()
+IS_MYSQL = "mysql" in DB_URI.lower()
+
+# Create SQLAlchemy engine with connection pool recycling
+try:
+    if IS_MYSQL:
+        engine = create_engine(
+            DB_URI,
+            pool_recycle=3600,
+            pool_pre_ping=True,
+            connect_args={"connect_timeout": 5}
+        )
+        with engine.connect() as test_conn:
+            print(f"[*] Successfully connected to MySQL database: {re.sub(r':([^@]+)@', ':****@', DB_URI)}")
+    else:
+        engine = create_engine(
+            DB_URI,
+            connect_args={"check_same_thread": False} if "sqlite" in DB_URI else {}
+        )
+        print(f"[*] Using local database engine: {DB_URI}")
+except Exception as e:
+    print(f"[!] Warning: Database connection to {re.sub(r':([^@]+)@', ':****@', DB_URI)} failed: {e}")
+    db_path = os.path.join(os.path.dirname(__file__), "vericamp.db")
+    DB_URI = f"sqlite:///{db_path}"
+    IS_MYSQL = False
+    engine = create_engine(DB_URI, connect_args={"check_same_thread": False})
+    print(f"[*] Fallback to SQLite database at {db_path}")
+
+SessionLocal = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
+
+def get_db_session():
+    """Returns a thread-safe scoped database session"""
+    return SessionLocal()
+
+
+# --- DATABASE MODELS ---
+
+class User(Base):
+    """
+    Users / Faculty Table
+    Stores administrative and teaching staff accounts.
+    Never exposes password hashes to APIs.
+    """
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    employee_id = Column(String(50), unique=True, nullable=False, index=True)
+    full_name = Column(String(120), nullable=False)
+    email = Column(String(120), nullable=False)
+    department = Column(String(100), nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+    role = Column(String(20), nullable=False, default="teacher", index=True)  # 'teacher' or 'admin'
+    phone = Column(String(30), nullable=True)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # Relationships
+    face_enrollment = relationship("FaceEnrollment", back_populates="user", uselist=False, cascade="all, delete-orphan")
+    attendance_records = relationship("AttendanceRecord", back_populates="user", cascade="all, delete-orphan")
+    audit_logs = relationship("AuditLog", back_populates="user")
+    leave_requests = relationship("LeaveRequest", foreign_keys="[LeaveRequest.teacher_id]", back_populates="teacher", cascade="all, delete-orphan")
+    face_update_requests = relationship("FaceUpdateRequest", foreign_keys="[FaceUpdateRequest.teacher_id]", back_populates="teacher", cascade="all, delete-orphan")
+    notifications = relationship("Notification", foreign_keys="[Notification.recipient_user_id]", back_populates="recipient", cascade="all, delete-orphan")
+
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+    def to_dict(self):
+        """Safe serialization: NEVER expose password_hash"""
+        enrollment_status = "not_enrolled"
+        enrolled_at = None
+        if self.face_enrollment:
+            enrollment_status = self.face_enrollment.enrollment_status
+            enrolled_at = self.face_enrollment.enrolled_at.isoformat() if self.face_enrollment.enrolled_at else None
+
+        return {
+            "id": self.id,
+            "employee_id": self.employee_id,
+            "username": self.employee_id.lower(),
+            "full_name": self.full_name,
+            "email": self.email,
+            "department": self.department,
+            "role": self.role,
+            "phone": self.phone,
+            "is_active": 1 if self.is_active else 0,
+            "face_enrollment_status": enrollment_status,
+            "is_enrolled": enrollment_status == "enrolled",
+            "enrolled_at": enrolled_at,
+            "created_at": self.created_at.isoformat() if self.created_at else None
+        }
+
+
+class FaceEnrollment(Base):
+    """
+    Face Enrollments Table
+    Stores reference biometric face templates and model versioning.
+    Never exposes raw face templates through frontend APIs.
+    """
+    __tablename__ = "face_enrollments"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False, index=True)
+    face_template = Column(Text, nullable=False)  # Encrypted/hashed biometric template vector
+    model_name = Column(String(60), default="OpenCV-Haar-HSV-Histogram", nullable=False)
+    model_version = Column(String(20), default="v2.4", nullable=False)
+    enrollment_status = Column(String(20), default="enrolled", nullable=False)  # 'enrolled', 'pending', 'revoked'
+    enrolled_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    user = relationship("User", back_populates="face_enrollment")
+
+    def to_dict(self):
+        """Safe serialization: NEVER expose face_template"""
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "model_name": self.model_name,
+            "model_version": self.model_version,
+            "enrollment_status": self.enrollment_status,
+            "enrolled_at": self.enrolled_at.isoformat() if self.enrolled_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+class AttendanceRecord(Base):
+    """
+    Attendance Records Table
+    Records immutable verified presence logs with OpenCV face score and Haversine distance.
+    """
+    __tablename__ = "attendance_records"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    attendance_date = Column(Date, nullable=False, index=True)
+    check_in_time = Column(SqlTime, nullable=False)
+    latitude = Column(Numeric(10, 7), nullable=False)
+    longitude = Column(Numeric(10, 7), nullable=False)
+    distance_meters = Column(Numeric(8, 2), nullable=False)
+    face_score = Column(Numeric(5, 2), nullable=False)
+    face_verification_status = Column(String(20), nullable=False)  # 'verified', 'failed'
+    location_verification_status = Column(String(20), nullable=False)  # 'verified', 'failed'
+    attendance_status = Column(String(20), nullable=False, index=True)  # 'present', 'late', 'rejected'
+    device_info = Column(String(255), nullable=True)
+    failure_reason = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    user = relationship("User", back_populates="attendance_records")
+
+    __table_args__ = (
+        Index("idx_attendance_user_date", "user_id", "attendance_date"),
+    )
+
+    def to_dict(self):
+        check_in_str = self.check_in_time.strftime("%H:%M:%S") if isinstance(self.check_in_time, (time, datetime)) else str(self.check_in_time)
+        date_str = self.attendance_date.isoformat() if isinstance(self.attendance_date, (date, datetime)) else str(self.attendance_date)
+        iso_timestamp = f"{date_str}T{check_in_str}"
+
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "employee_id": self.user.employee_id if self.user else None,
+            "full_name": self.user.full_name if self.user else None,
+            "department": self.user.department if self.user else None,
+            "date": date_str,
+            "attendance_date": date_str,
+            "timestamp": iso_timestamp,
+            "check_in_time": check_in_str,
+            "status": self.attendance_status,
+            "attendance_status": self.attendance_status,
+            "face_score": float(self.face_score) if self.face_score is not None else 0.0,
+            "face_verification_status": self.face_verification_status,
+            "distance_meters": float(self.distance_meters) if self.distance_meters is not None else 0.0,
+            "location_verification_status": self.location_verification_status,
+            "inside_campus": 1 if self.location_verification_status == "verified" else 0,
+            "latitude": float(self.latitude) if self.latitude is not None else 0.0,
+            "longitude": float(self.longitude) if self.longitude is not None else 0.0,
+            "device_info": self.device_info,
+            "failure_reason": self.failure_reason,
+            "created_at": self.created_at.isoformat() if self.created_at else None
+        }
+
+
+class LeaveRequest(Base):
+    """
+    Leave Requests Table
+    Stores teacher leave applications, approval workflow status, and administrator remarks.
+    """
+    __tablename__ = "leave_requests"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    teacher_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    leave_type = Column(String(50), nullable=False)  # 'Casual Leave', 'Medical Leave', 'Duty Leave', 'Other'
+    start_date = Column(Date, nullable=False, index=True)
+    end_date = Column(Date, nullable=False, index=True)
+    reason = Column(Text, nullable=False)
+    status = Column(String(20), default="pending", nullable=False, index=True)  # 'pending', 'approved', 'rejected', 'cancelled'
+    admin_remarks = Column(Text, nullable=True)
+    reviewed_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    reviewed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    teacher = relationship("User", foreign_keys=[teacher_id], back_populates="leave_requests")
+    reviewer = relationship("User", foreign_keys=[reviewed_by])
+
+    __table_args__ = (
+        Index("idx_leave_teacher_dates", "teacher_id", "start_date", "end_date"),
+    )
+
+    def to_dict(self):
+        duration_days = 0
+        if self.start_date and self.end_date:
+            try:
+                duration_days = (self.end_date - self.start_date).days + 1
+            except:
+                duration_days = 1
+
+        return {
+            "id": self.id,
+            "teacher_id": self.teacher_id,
+            "teacher_name": self.teacher.full_name if self.teacher else "Unknown",
+            "employee_id": self.teacher.employee_id if self.teacher else "",
+            "department": self.teacher.department if self.teacher else "",
+            "leave_type": self.leave_type,
+            "start_date": self.start_date.isoformat() if isinstance(self.start_date, (date, datetime)) else str(self.start_date),
+            "end_date": self.end_date.isoformat() if isinstance(self.end_date, (date, datetime)) else str(self.end_date),
+            "duration_days": duration_days,
+            "reason": self.reason,
+            "status": self.status,
+            "admin_remarks": self.admin_remarks or "",
+            "reviewed_by": self.reviewed_by,
+            "reviewer_name": self.reviewer.full_name if self.reviewer else None,
+            "reviewed_at": self.reviewed_at.isoformat() if self.reviewed_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+class FaceUpdateRequest(Base):
+    """
+    Face Update Requests Table
+    Stores teacher face biometric update requests with reason and admin re-enrollment status.
+    """
+    __tablename__ = "face_update_requests"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    teacher_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    reason = Column(Text, nullable=False)
+    status = Column(String(20), default="pending", nullable=False, index=True)  # 'pending', 'approved', 'rejected', 'cancelled', 'completed'
+    admin_remarks = Column(Text, nullable=True)
+    reviewed_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    reviewed_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    teacher = relationship("User", foreign_keys=[teacher_id], back_populates="face_update_requests")
+    reviewer = relationship("User", foreign_keys=[reviewed_by])
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "teacher_id": self.teacher_id,
+            "teacher_name": self.teacher.full_name if self.teacher else "Unknown",
+            "employee_id": self.teacher.employee_id if self.teacher else "",
+            "department": self.teacher.department if self.teacher else "",
+            "reason": self.reason,
+            "status": self.status,
+            "admin_remarks": self.admin_remarks or "",
+            "reviewed_by": self.reviewed_by,
+            "reviewer_name": self.reviewer.full_name if self.reviewer else None,
+            "reviewed_at": self.reviewed_at.isoformat() if self.reviewed_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+class Notification(Base):
+    """
+    Notifications Table
+    System notifications for leave status, face updates, and administrative alerts.
+    """
+    __tablename__ = "notifications"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    recipient_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    notification_type = Column(String(40), nullable=False)  # 'leave_request', 'leave_status', 'face_update_request', 'face_update_status', 'system'
+    title = Column(String(150), nullable=False)
+    message = Column(Text, nullable=False)
+    related_record_id = Column(String(50), nullable=True)
+    is_read = Column(Boolean, default=False, nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+    recipient = relationship("User", foreign_keys=[recipient_user_id], back_populates="notifications")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "recipient_user_id": self.recipient_user_id,
+            "notification_type": self.notification_type,
+            "title": self.title,
+            "message": self.message,
+            "related_record_id": self.related_record_id,
+            "is_read": bool(self.is_read),
+            "created_at": self.created_at.isoformat() if self.created_at else None
+        }
+
+
+class CampusSettings(Base):
+    """
+    Campus Settings Table
+    Stores institutional perimeter boundaries and GPS geofence radius.
+    """
+    __tablename__ = "campus_settings"
+
+    id = Column(Integer, primary_key=True, autoincrement=False, default=1)
+    campus_name = Column(String(150), nullable=False)
+    latitude = Column(Numeric(10, 7), nullable=False)
+    longitude = Column(Numeric(10, 7), nullable=False)
+    allowed_radius_meters = Column(Numeric(8, 2), nullable=False)
+    wifi_ssid_required = Column(Boolean, default=False)
+    wifi_ssid_name = Column(String(100), nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "campus_name": self.campus_name,
+            "latitude": float(self.latitude),
+            "longitude": float(self.longitude),
+            "allowed_radius_meters": float(self.allowed_radius_meters),
+            "wifi_ssid_required": 1 if self.wifi_ssid_required else 0,
+            "wifi_ssid_name": self.wifi_ssid_name or "",
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+class AuditLog(Base):
+    """
+    Audit Logs Table
+    Centralized audit trail for administrative actions, status toggles, and attendance events.
+    """
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    action = Column(String(60), nullable=False, index=True)
+    target_type = Column(String(40), nullable=False)
+    target_id = Column(String(50), nullable=True)
+    details = Column(Text, nullable=False)
+    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+    user = relationship("User", back_populates="audit_logs")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "user_name": self.user.full_name if self.user else "System",
+            "user_role": self.user.role if self.user else "system",
+            "action": self.action,
+            "target_type": self.target_type,
+            "target_id": self.target_id,
+            "details": self.details,
+            "timestamp": self.timestamp.isoformat() if self.timestamp else None
+        }

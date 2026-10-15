@@ -1,0 +1,276 @@
+"""
+VERICAMP - Smart Faculty Attendance System
+Database Setup & Migration Script
+Executes SQLAlchemy schema migrations and seeds initial records for MySQL / MariaDB / SQLite.
+"""
+
+import sys
+import os
+from datetime import datetime, date, timedelta, time
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from sqlalchemy import text
+from database import (
+    engine, Base, SessionLocal, User, FaceEnrollment, 
+    AttendanceRecord, CampusSettings, AuditLog, 
+    LeaveRequest, FaceUpdateRequest, Notification,
+    IS_MYSQL, DB_URI
+)
+from werkzeug.security import generate_password_hash
+
+def setup_database():
+    print("=" * 60)
+    print(" VERICAMP - Database Setup & Migration")
+    print(f" Target Engine: {'MySQL' if IS_MYSQL else 'SQLite'}")
+    print(f" Target URI: {DB_URI}")
+    print("=" * 60)
+
+    try:
+        # Create all tables defined in SQLAlchemy models
+        print("[*] Creating database tables (DDL migration)...")
+        Base.metadata.create_all(bind=engine)
+        print("    [OK] Tables verified: users, face_enrollments, attendance_records, campus_settings, audit_logs, leave_requests, face_update_requests, notifications")
+
+        # Migrate existing SQLite/MySQL columns if older schema is present
+        with engine.connect() as conn:
+            # Check face_enrollments columns
+            try:
+                res = conn.execute(text("SELECT * FROM face_enrollments LIMIT 1"))
+                cols = res.keys()
+                if "face_template" not in cols:
+                    print("[*] Migrating face_enrollments: adding face_template, model_name, model_version, enrollment_status...")
+                    conn.execute(text("ALTER TABLE face_enrollments ADD COLUMN face_template TEXT DEFAULT 'sha256_enc_template'"))
+                    if "template_hash" in cols:
+                        conn.execute(text("UPDATE face_enrollments SET face_template = template_hash WHERE face_template IS NULL OR face_template = 'sha256_enc_template'"))
+                if "model_name" not in cols:
+                    conn.execute(text("ALTER TABLE face_enrollments ADD COLUMN model_name VARCHAR(60) DEFAULT 'OpenCV-Haar-HSV-Histogram'"))
+                if "model_version" not in cols:
+                    conn.execute(text("ALTER TABLE face_enrollments ADD COLUMN model_version VARCHAR(20) DEFAULT 'v2.4'"))
+                if "enrollment_status" not in cols:
+                    conn.execute(text("ALTER TABLE face_enrollments ADD COLUMN enrollment_status VARCHAR(20) DEFAULT 'enrolled'"))
+                    if "status" in cols:
+                        conn.execute(text("UPDATE face_enrollments SET enrollment_status = status WHERE enrollment_status IS NULL OR enrollment_status = 'enrolled'"))
+                conn.commit()
+            except Exception as e:
+                print(f"[i] face_enrollments migration notice: {e}")
+
+            # Check attendance_records columns
+            try:
+                res = conn.execute(text("SELECT * FROM attendance_records LIMIT 1"))
+                cols = res.keys()
+                if "attendance_date" not in cols:
+                    print("[*] Migrating attendance_records: adding attendance_date, check_in_time, face_verification_status, location_verification_status, attendance_status...")
+                    conn.execute(text("ALTER TABLE attendance_records ADD COLUMN attendance_date DATE"))
+                    if "date" in cols:
+                        conn.execute(text("UPDATE attendance_records SET attendance_date = date"))
+                if "check_in_time" not in cols:
+                    conn.execute(text("ALTER TABLE attendance_records ADD COLUMN check_in_time TIME DEFAULT '09:00:00'"))
+                if "face_verification_status" not in cols:
+                    conn.execute(text("ALTER TABLE attendance_records ADD COLUMN face_verification_status VARCHAR(20) DEFAULT 'verified'"))
+                if "location_verification_status" not in cols:
+                    conn.execute(text("ALTER TABLE attendance_records ADD COLUMN location_verification_status VARCHAR(20) DEFAULT 'verified'"))
+                if "attendance_status" not in cols:
+                    conn.execute(text("ALTER TABLE attendance_records ADD COLUMN attendance_status VARCHAR(20) DEFAULT 'present'"))
+                    if "status" in cols:
+                        conn.execute(text("UPDATE attendance_records SET attendance_status = status"))
+                conn.commit()
+            except Exception as e:
+                print(f"[i] attendance_records migration notice: {e}")
+
+        session = SessionLocal()
+
+        # Check if users exist
+        user_count = session.query(User).count()
+        if user_count == 0:
+            print("[*] Seeding default institutional data...")
+            now = datetime.utcnow()
+            today = date.today()
+
+            # 1. Campus Settings
+            campus = CampusSettings(
+                id=1,
+                campus_name="Swami Keshvanand Institute of Technology (SKIT) - Campus",
+                latitude=26.8227000,
+                longitude=75.8653000,
+                allowed_radius_meters=300.0,
+                wifi_ssid_required=True,
+                wifi_ssid_name="SKIT_CAMPUS_SECURE",
+                updated_at=now
+            )
+            session.add(campus)
+
+            # 2. Users (Admin + Teachers)
+            admin_user = User(
+                employee_id="ADM-001",
+                full_name="Prof. K. N. Sharma",
+                email="admin@vericamp.edu",
+                department="Institutional Administration",
+                password_hash=generate_password_hash("admin123"),
+                role="admin",
+                phone="+91 98290 11223",
+                is_active=True,
+                created_at=now
+            )
+            session.add(admin_user)
+            session.flush()
+
+            teachers_data = [
+                ("EMP-1001", "Dr. Ananya Sharma", "ananya.sharma@vericamp.edu", "Computer Science & Engg", "+91 98290 33445", "enrolled"),
+                ("EMP-1002", "Prof. Rajesh Verma", "rajesh.verma@vericamp.edu", "Electronics & Comm. Engg", "+91 98290 44556", "enrolled"),
+                ("EMP-1003", "Dr. Sunita Rao", "sunita.rao@vericamp.edu", "Mechanical Engineering", "+91 98290 55667", "enrolled"),
+                ("EMP-1004", "Er. Amit Patel", "amit.patel@vericamp.edu", "Information Technology", "+91 98290 66778", "pending"),
+                ("EMP-1005", "Dr. Priya Nair", "priya.nair@vericamp.edu", "Applied Sciences & Math", "+91 98290 77889", "enrolled"),
+            ]
+
+            teacher_objs = []
+            for emp_id, name, email, dept, phone, enroll_status in teachers_data:
+                t_user = User(
+                    employee_id=emp_id,
+                    full_name=name,
+                    email=email,
+                    department=dept,
+                    password_hash=generate_password_hash("teacher123"),
+                    role="teacher",
+                    phone=phone,
+                    is_active=True,
+                    created_at=now
+                )
+                session.add(t_user)
+                session.flush()
+                teacher_objs.append((t_user, enroll_status))
+
+                # 3. Biometric Face Enrollments
+                fe = FaceEnrollment(
+                    user_id=t_user.id,
+                    face_template=f"sha256_enc_template_{emp_id.lower()}_v2.4",
+                    model_name="OpenCV-Haar-HSV-Histogram",
+                    model_version="v2.4",
+                    enrollment_status=enroll_status,
+                    enrolled_at=now,
+                    updated_at=now
+                )
+                session.add(fe)
+
+            # 4. Past 5 days attendance records for Dr. Ananya Sharma (EMP-1001)
+            ananya = teacher_objs[0][0]
+            for i in range(1, 6):
+                past_date = today - timedelta(days=i)
+                att = AttendanceRecord(
+                    user_id=ananya.id,
+                    attendance_date=past_date,
+                    check_in_time=time(8, 52, 14),
+                    latitude=26.8229000,
+                    longitude=75.8651000,
+                    distance_meters=42.30,
+                    face_score=96.50,
+                    face_verification_status="verified",
+                    location_verification_status="verified",
+                    attendance_status="present",
+                    device_info="Chrome Mobile / Android 14",
+                    created_at=now - timedelta(days=i)
+                )
+                session.add(att)
+
+            # Sample rejected attendance record
+            att_rej = AttendanceRecord(
+                user_id=ananya.id,
+                attendance_date=today - timedelta(days=7),
+                check_in_time=time(9, 12, 0),
+                latitude=26.8300000,
+                longitude=75.8720000,
+                distance_meters=850.00,
+                face_score=94.20,
+                face_verification_status="verified",
+                location_verification_status="failed",
+                attendance_status="rejected",
+                device_info="Chrome Mobile / Android 14",
+                failure_reason="Outside Campus Geofence (850.0m > 300.0m)",
+                created_at=now - timedelta(days=7)
+            )
+            session.add(att_rej)
+
+            # 5. Audit Log Entry
+            audit = AuditLog(
+                user_id=admin_user.id,
+                action="SYSTEM_INIT",
+                target_type="DATABASE",
+                target_id="1",
+                details="VERICAMP database schema migrated and initial faculty seeded.",
+                timestamp=now
+            )
+            session.add(audit)
+
+            session.commit()
+            print("    [OK] Seeded default campus settings, admin, and 5 faculty members.")
+        else:
+            print(f"    [i] Database already contains {user_count} user record(s). Skipping initial seed.")
+
+        # Seed sample leave request if table is empty (e.g. for demonstration)
+        leave_count = session.query(LeaveRequest).count()
+        if leave_count == 0:
+            ananya = session.query(User).filter(User.employee_id == "EMP-1001").first()
+            admin = session.query(User).filter(User.role == "admin").first()
+            if ananya:
+                # Sample past approved leave
+                past_leave = LeaveRequest(
+                    teacher_id=ananya.id,
+                    leave_type="Casual Leave",
+                    start_date=date.today() - timedelta(days=12),
+                    end_date=date.today() - timedelta(days=10),
+                    reason="Attending National Faculty Development Program on AI in Education.",
+                    status="approved",
+                    admin_remarks="Approved for FDP attendance. Academic duties re-assigned.",
+                    reviewed_by=admin.id if admin else None,
+                    reviewed_at=datetime.utcnow() - timedelta(days=13),
+                    created_at=datetime.utcnow() - timedelta(days=14)
+                )
+                session.add(past_leave)
+
+                # Sample pending leave for another teacher (EMP-1002)
+                rajesh = session.query(User).filter(User.employee_id == "EMP-1002").first()
+                if rajesh:
+                    pending_leave = LeaveRequest(
+                        teacher_id=rajesh.id,
+                        leave_type="Medical Leave",
+                        start_date=date.today() + timedelta(days=3),
+                        end_date=date.today() + timedelta(days=5),
+                        reason="Medical checkup and recovery following dental procedure.",
+                        status="pending",
+                        created_at=datetime.utcnow()
+                    )
+                    session.add(pending_leave)
+
+                session.commit()
+                print("    [OK] Seeded initial demonstration leave requests.")
+
+        # Print current summary
+        u_count = session.query(User).count()
+        f_count = session.query(FaceEnrollment).count()
+        a_count = session.query(AttendanceRecord).count()
+        l_count = session.query(LeaveRequest).count()
+        fu_count = session.query(FaceUpdateRequest).count()
+        n_count = session.query(Notification).count()
+
+        print("\n[*] Database Status Summary:")
+        print(f"    - Total Users: {u_count}")
+        print(f"    - Enrolled Face Templates: {f_count}")
+        print(f"    - Attendance Records: {a_count}")
+        print(f"    - Leave Requests: {l_count}")
+        print(f"    - Face Update Requests: {fu_count}")
+        print(f"    - Notifications: {n_count}")
+        print("\n[OK] Database setup completed successfully!")
+
+        session.close()
+        return True
+
+    except Exception as e:
+        print(f"\n[!] Error during database setup: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+if __name__ == "__main__":
+    success = setup_database()
+    sys.exit(0 if success else 1)

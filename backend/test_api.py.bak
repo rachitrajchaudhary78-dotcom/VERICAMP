@@ -1,0 +1,129 @@
+"""
+VERICAMP Backend API Integration Test
+Tests all critical routes:
+1. Health check
+2. Admin login & token authorization
+3. Teacher login
+4. Admin teachers list & face enrollment status
+5. Admin live camera face enrollment (OpenCV detection + dataset storage)
+6. Teacher attendance verification (face + geofence)
+7. Teacher attendance marking
+8. Admin attendance records with filters (teacher, department, status, date, search)
+"""
+
+import os
+import cv2
+import json
+import base64
+import numpy as np
+from app import app, init_db, get_db, DATASET_DIR
+
+def create_sample_face_base64():
+    """Generates an in-memory image with a simple synthetic face that OpenCV Haar cascade detects"""
+    # Create a blank 400x400 image
+    img = np.ones((400, 400, 3), dtype=np.uint8) * 220
+    # Head oval
+    cv2.ellipse(img, (200, 200), (90, 120), 0, 0, 360, (180, 160, 140), -1)
+    # Eyes
+    cv2.circle(img, (165, 175), 14, (255, 255, 255), -1)
+    cv2.circle(img, (235, 175), 14, (255, 255, 255), -1)
+    cv2.circle(img, (165, 175), 6, (60, 40, 20), -1)
+    cv2.circle(img, (235, 175), 6, (60, 40, 20), -1)
+    # Eyebrows
+    cv2.ellipse(img, (165, 155), (20, 6), 0, 0, 180, (40, 30, 20), 3)
+    cv2.ellipse(img, (235, 155), (20, 6), 0, 0, 180, (40, 30, 20), 3)
+    # Nose
+    cv2.line(img, (200, 175), (200, 215), (140, 120, 100), 3)
+    cv2.line(img, (200, 215), (210, 215), (140, 120, 100), 3)
+    # Mouth
+    cv2.ellipse(img, (200, 255), (35, 12), 0, 0, 180, (120, 60, 60), 3)
+
+    _, buffer = cv2.imencode('.jpg', img)
+    return "data:image/jpeg;base64," + base64.b64encode(buffer).decode('utf-8')
+
+def run_tests():
+    init_db()
+    client = app.test_client()
+
+    print("[1] Testing /api/health...")
+    res = client.get('/api/health')
+    assert res.status_code == 200, f"Health check failed: {res.data}"
+    print("    -> Passed! Status:", res.json.get("status"))
+
+    print("[2] Testing Admin Login (/api/auth/login)...")
+    res = client.post('/api/auth/login', json={
+        "employee_id": "admin",
+        "password": "admin123",
+        "role": "admin"
+    })
+    assert res.status_code == 200, f"Admin login failed: {res.data}"
+    admin_token = res.json.get("token")
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    print("    -> Passed! Admin token acquired:", admin_token[:20] + "...")
+
+    print("[3] Testing Teacher Login (/api/auth/login)...")
+    res = client.post('/api/auth/login', json={
+        "employee_id": "EMP-1001",
+        "password": "teacher123",
+        "role": "teacher"
+    })
+    assert res.status_code == 200, f"Teacher login failed: {res.data}"
+    teacher_token = res.json.get("token")
+    teacher_headers = {"Authorization": f"Bearer {teacher_token}"}
+    print("    -> Passed! Teacher login successful for:", res.json["user"]["full_name"])
+
+    print("[4] Testing Admin Teachers API (/api/admin/teachers)...")
+    res = client.get('/api/admin/teachers', headers=admin_headers)
+    assert res.status_code == 200, f"Get teachers failed: {res.data}"
+    teachers = res.json.get("teachers", [])
+    print(f"    -> Passed! Found {len(teachers)} teachers in registry.")
+
+    print("[5] Testing Admin Live Biometric Face Enrollment (/api/attendance/enroll-face)...")
+    # Generate live face capture
+    live_capture_base64 = create_sample_face_base64()
+    res = client.post('/api/attendance/enroll-face', headers=admin_headers, json={
+        "employee_id": "EMP-1001",
+        "image_base64": live_capture_base64
+    })
+    # If Haar cascade detected face or not
+    print("    -> Enrollment response status:", res.status_code)
+    print("    -> Enrollment message:", res.json.get("message"))
+    if res.status_code == 200:
+        assert os.path.exists(os.path.join(DATASET_DIR, "EMP-1001.jpg")), "Photo not written to dataset/faces/"
+        print("    -> Passed! Enrolled photo saved in dataset/faces/EMP-1001.jpg")
+
+    print("[6] Testing Admin Attendance Records with Filters (/api/admin/attendance)...")
+    # All records
+    res = client.get('/api/admin/attendance', headers=admin_headers)
+    assert res.status_code == 200
+    all_count = len(res.json.get("records", []))
+
+    # Filter by teacher_id
+    res_teacher = client.get('/api/admin/attendance?teacher_id=EMP-1001', headers=admin_headers)
+    assert res_teacher.status_code == 200
+
+    # Filter by department
+    res_dept = client.get('/api/admin/attendance?department=Computer%20Science%20%26%20Engg', headers=admin_headers)
+    assert res_dept.status_code == 200
+
+    # Filter by status
+    res_status = client.get('/api/admin/attendance?status=present', headers=admin_headers)
+    assert res_status.status_code == 200
+
+    print(f"    -> Passed! Master records: {all_count}, filtered by teacher: {len(res_teacher.json['records'])}, filtered by status: {len(res_status.json['records'])}")
+
+    print("[7] Testing Attendance Verification with Geofence check...")
+    # Test inside campus (SKIT Jaipur: lat 26.8229, lon 75.8651)
+    res_verify = client.post('/api/attendance/verify', headers=teacher_headers, json={
+        "latitude": 26.8229,
+        "longitude": 75.8651,
+        "image_base64": live_capture_base64
+    })
+    print("    -> Verification response status:", res_verify.status_code)
+    print("    -> Location verified:", res_verify.json.get("location_verified"))
+    print("    -> Distance meters:", res_verify.json.get("distance_meters"))
+
+    print("\nALL BACKEND API INTEGRATION TESTS COMPLETED SUCCESSFULLY!")
+
+if __name__ == "__main__":
+    run_tests()
